@@ -13,6 +13,10 @@
 (define-constant ERR_PRICING_UPDATE_FAILED (err u109))
 (define-constant ERR_INVALID_TIER (err u110))
 (define-constant ERR_DEMAND_THRESHOLD_EXCEEDED (err u111))
+(define-constant ERR_ALREADY_IN_QUEUE (err u112))
+(define-constant ERR_QUEUE_FULL (err u113))
+(define-constant ERR_NOT_IN_QUEUE (err u114))
+(define-constant ERR_QUEUE_EXPIRED (err u115))
 
 (define-constant SURGE_MULTIPLIER u150)
 (define-constant PEAK_DEMAND_THRESHOLD u5)
@@ -26,6 +30,9 @@
 (define-data-var surge-pricing-active bool false)
 (define-data-var last-pricing-update uint u0)
 (define-data-var total-revenue uint u0)
+(define-data-var next-reservation-id uint u1)
+(define-data-var max-queue-size uint u10)
+(define-data-var reservation-validity-period uint u1440)
 
 (define-map parking-spots 
   uint 
@@ -90,6 +97,36 @@
     market-temperature: uint,
     revenue-efficiency: uint,
     optimization-score: uint
+  }
+)
+
+(define-map reservation-queue
+  { spot-id: uint, queue-position: uint }
+  {
+    reserver: principal,
+    reserved-at: uint,
+    desired-duration: uint,
+    max-price: uint,
+    auto-claim: bool,
+    active: bool
+  }
+)
+
+(define-map user-reservations
+  { user: principal, spot-id: uint }
+  {
+    queue-position: uint,
+    reservation-id: uint,
+    active: bool
+  }
+)
+
+(define-map spot-queue-info
+  uint
+  {
+    queue-length: uint,
+    next-available-position: uint,
+    total-reservations: uint
   }
 )
 
@@ -769,6 +806,256 @@
 (define-read-only (get-all-user-spots (user principal))
   (let ((max-spots u100))
     (map get-spot-if-owned (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
+  )
+)
+
+(define-read-only (get-reservation-queue-entry (spot-id uint) (position uint))
+  (map-get? reservation-queue { spot-id: spot-id, queue-position: position })
+)
+
+(define-read-only (get-user-reservation (user principal) (spot-id uint))
+  (map-get? user-reservations { user: user, spot-id: spot-id })
+)
+
+(define-read-only (get-spot-queue-info (spot-id uint))
+  (default-to
+    { queue-length: u0, next-available-position: u1, total-reservations: u0 }
+    (map-get? spot-queue-info spot-id)
+  )
+)
+
+(define-read-only (get-queue-position (user principal) (spot-id uint))
+  (match (map-get? user-reservations { user: user, spot-id: spot-id })
+    reservation
+      (if (get active reservation)
+        (ok (get queue-position reservation))
+        (err ERR_NOT_IN_QUEUE))
+    (err ERR_NOT_IN_QUEUE)
+  )
+)
+
+(define-read-only (estimate-wait-time (spot-id uint) (queue-position uint))
+  (match (map-get? parking-spots spot-id)
+    spot-data
+      (let 
+        (
+          (current-block burn-block-height)
+          (end-block (get end-block spot-data))
+          (remaining-time (if (> end-block current-block) (- end-block current-block) u0))
+        )
+        (ok (+ remaining-time (* (- queue-position u1) u144)))
+      )
+    (ok (* queue-position u144))
+  )
+)
+
+(define-public (join-reservation-queue
+  (spot-id uint)
+  (desired-duration uint)
+  (max-price uint)
+  (auto-claim bool)
+)
+  (let 
+    (
+      (current-block burn-block-height)
+      (queue-info (get-spot-queue-info spot-id))
+      (current-position (get next-available-position queue-info))
+      (reservation-id (var-get next-reservation-id))
+    )
+    (asserts! (> desired-duration u0) ERR_INVALID_DURATION)
+    (asserts! (> max-price u0) ERR_INSUFFICIENT_PAYMENT)
+    (asserts! (is-none (map-get? user-reservations { user: tx-sender, spot-id: spot-id })) ERR_ALREADY_IN_QUEUE)
+    (asserts! (< (get queue-length queue-info) (var-get max-queue-size)) ERR_QUEUE_FULL)
+    
+    (map-set reservation-queue
+      { spot-id: spot-id, queue-position: current-position }
+      {
+        reserver: tx-sender,
+        reserved-at: current-block,
+        desired-duration: desired-duration,
+        max-price: max-price,
+        auto-claim: auto-claim,
+        active: true
+      })
+    
+    (map-set user-reservations
+      { user: tx-sender, spot-id: spot-id }
+      {
+        queue-position: current-position,
+        reservation-id: reservation-id,
+        active: true
+      })
+    
+    (map-set spot-queue-info spot-id
+      {
+        queue-length: (+ (get queue-length queue-info) u1),
+        next-available-position: (+ current-position u1),
+        total-reservations: (+ (get total-reservations queue-info) u1)
+      })
+    
+    (var-set next-reservation-id (+ reservation-id u1))
+    (ok current-position)
+  )
+)
+
+(define-public (cancel-reservation (spot-id uint))
+  (let 
+    (
+      (user-reservation (unwrap! (map-get? user-reservations { user: tx-sender, spot-id: spot-id }) ERR_NOT_IN_QUEUE))
+      (queue-position (get queue-position user-reservation))
+      (queue-info (get-spot-queue-info spot-id))
+    )
+    (asserts! (get active user-reservation) ERR_NOT_IN_QUEUE)
+    
+    (map-set reservation-queue
+      { spot-id: spot-id, queue-position: queue-position }
+      (merge 
+        (unwrap! (map-get? reservation-queue { spot-id: spot-id, queue-position: queue-position }) ERR_NOT_IN_QUEUE)
+        { active: false }
+      )
+    )
+    
+    (map-set user-reservations
+      { user: tx-sender, spot-id: spot-id }
+      (merge user-reservation { active: false })
+    )
+    
+    (map-set spot-queue-info spot-id
+      (merge queue-info { queue-length: (- (get queue-length queue-info) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-from-queue (spot-id uint))
+  (let 
+    (
+      (current-block burn-block-height)
+      (user-reservation (unwrap! (map-get? user-reservations { user: tx-sender, spot-id: spot-id }) ERR_NOT_IN_QUEUE))
+      (queue-position (get queue-position user-reservation))
+      (reservation-entry (unwrap! (map-get? reservation-queue { spot-id: spot-id, queue-position: queue-position }) ERR_NOT_IN_QUEUE))
+      (reserved-at (get reserved-at reservation-entry))
+      (desired-duration (get desired-duration reservation-entry))
+      (max-price (get max-price reservation-entry))
+      (dynamic-cost (calculate-dynamic-price spot-id desired-duration))
+    )
+    (asserts! (get active user-reservation) ERR_NOT_IN_QUEUE)
+    (asserts! (get active reservation-entry) ERR_NOT_IN_QUEUE)
+    (asserts! (is-spot-available spot-id) ERR_SPOT_OCCUPIED)
+    (asserts! (<= (- current-block reserved-at) (var-get reservation-validity-period)) ERR_QUEUE_EXPIRED)
+    (asserts! (<= dynamic-cost max-price) ERR_INSUFFICIENT_PAYMENT)
+    
+    (try! (stx-transfer? dynamic-cost tx-sender CONTRACT_OWNER))
+    (try! (nft-mint? parking-right spot-id tx-sender))
+    
+    (map-set parking-spots spot-id {
+      owner: (some tx-sender),
+      start-block: current-block,
+      end-block: (+ current-block desired-duration),
+      price-paid: dynamic-cost,
+      transferable: true
+    })
+    
+    (map-set reservation-queue
+      { spot-id: spot-id, queue-position: queue-position }
+      (merge reservation-entry { active: false })
+    )
+    
+    (map-set user-reservations
+      { user: tx-sender, spot-id: spot-id }
+      (merge user-reservation { active: false })
+    )
+    
+    (let ((queue-info (get-spot-queue-info spot-id)))
+      (map-set spot-queue-info spot-id
+        (merge queue-info { queue-length: (- (get queue-length queue-info) u1) })
+      )
+    )
+    
+    (unwrap-panic (track-booking-demand spot-id desired-duration))
+    (var-set total-revenue (+ (var-get total-revenue) dynamic-cost))
+    
+    (ok spot-id)
+  )
+)
+
+(define-public (process-next-in-queue (spot-id uint))
+  (let 
+    (
+      (current-block burn-block-height)
+      (queue-info (get-spot-queue-info spot-id))
+      (current-position u1)
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (> (get queue-length queue-info) u0) ERR_NOT_IN_QUEUE)
+    (asserts! (is-spot-available spot-id) ERR_SPOT_OCCUPIED)
+    
+    (try! (find-and-process-active-reservation spot-id current-position))
+    (ok true)
+  )
+)
+
+(define-private (find-and-process-active-reservation (spot-id uint) (position uint))
+  (match (map-get? reservation-queue { spot-id: spot-id, queue-position: position })
+    reservation
+      (if (and (get active reservation) (get auto-claim reservation))
+        (let 
+          (
+            (reserver (get reserver reservation))
+            (desired-duration (get desired-duration reservation))
+            (max-price (get max-price reservation))
+            (dynamic-cost (calculate-dynamic-price spot-id desired-duration))
+            (current-block burn-block-height)
+          )
+          (if (and 
+                (<= dynamic-cost max-price)
+                (<= (- current-block (get reserved-at reservation)) (var-get reservation-validity-period)))
+            (begin
+              (try! (stx-transfer? dynamic-cost reserver CONTRACT_OWNER))
+              (try! (nft-mint? parking-right spot-id reserver))
+              
+              (map-set parking-spots spot-id {
+                owner: (some reserver),
+                start-block: current-block,
+                end-block: (+ current-block desired-duration),
+                price-paid: dynamic-cost,
+                transferable: true
+              })
+              
+              (map-set reservation-queue
+                { spot-id: spot-id, queue-position: position }
+                (merge reservation { active: false })
+              )
+              
+              (unwrap-panic (track-booking-demand spot-id desired-duration))
+              (var-set total-revenue (+ (var-get total-revenue) dynamic-cost))
+              (ok true)
+            )
+            ERR_INSUFFICIENT_PAYMENT
+          )
+        )
+        ERR_NOT_IN_QUEUE
+      )
+    ERR_NOT_IN_QUEUE
+  )
+)
+
+(define-public (set-max-queue-size (new-size uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (> new-size u0) ERR_INVALID_DURATION)
+    (var-set max-queue-size new-size)
+    (ok true)
+  )
+)
+
+(define-public (set-reservation-validity-period (new-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (> new-period u0) ERR_INVALID_DURATION)
+    (var-set reservation-validity-period new-period)
+    (ok true)
   )
 )
 
