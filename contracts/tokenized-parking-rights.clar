@@ -17,6 +17,11 @@
 (define-constant ERR_QUEUE_FULL (err u113))
 (define-constant ERR_NOT_IN_QUEUE (err u114))
 (define-constant ERR_QUEUE_EXPIRED (err u115))
+(define-constant ERR_BLACKLISTED (err u116))
+(define-constant ERR_NO_VIOLATIONS (err u117))
+(define-constant ERR_ALREADY_RESOLVED (err u118))
+
+(define-constant BLACKLIST_THRESHOLD u3)
 
 (define-constant SURGE_MULTIPLIER u150)
 (define-constant PEAK_DEMAND_THRESHOLD u5)
@@ -33,6 +38,7 @@
 (define-data-var next-reservation-id uint u1)
 (define-data-var max-queue-size uint u10)
 (define-data-var reservation-validity-period uint u1440)
+(define-data-var next-violation-id uint u1)
 
 (define-map parking-spots 
   uint 
@@ -127,6 +133,28 @@
     queue-length: uint,
     next-available-position: uint,
     total-reservations: uint
+  }
+)
+
+(define-map violations
+  uint
+  {
+    offender: principal,
+    spot-id: uint,
+    violation-type: (string-ascii 20),
+    fine-amount: uint,
+    issued-at: uint,
+    resolved: bool
+  }
+)
+
+(define-map user-violation-count
+  principal
+  {
+    total-violations: uint,
+    unresolved-violations: uint,
+    total-fines-paid: uint,
+    blacklisted: bool
   }
 )
 
@@ -573,6 +601,7 @@
     (asserts! (> duration u0) ERR_INVALID_DURATION)
     (asserts! (<= duration (var-get max-duration)) ERR_INVALID_DURATION)
     (asserts! (is-spot-available spot-id) ERR_SPOT_OCCUPIED)
+    (asserts! (not (is-user-blacklisted tx-sender)) ERR_BLACKLISTED)
     
     (try! (stx-transfer? dynamic-cost tx-sender CONTRACT_OWNER))
     
@@ -866,6 +895,7 @@
     (asserts! (> max-price u0) ERR_INSUFFICIENT_PAYMENT)
     (asserts! (is-none (map-get? user-reservations { user: tx-sender, spot-id: spot-id })) ERR_ALREADY_IN_QUEUE)
     (asserts! (< (get queue-length queue-info) (var-get max-queue-size)) ERR_QUEUE_FULL)
+    (asserts! (not (is-user-blacklisted tx-sender)) ERR_BLACKLISTED)
     
     (map-set reservation-queue
       { spot-id: spot-id, queue-position: current-position }
@@ -1067,5 +1097,94 @@
         none
       )
     none
+  )
+)
+
+(define-read-only (get-violation (violation-id uint))
+  (map-get? violations violation-id)
+)
+
+(define-read-only (get-user-violations (user principal))
+  (default-to
+    { total-violations: u0, unresolved-violations: u0, total-fines-paid: u0, blacklisted: false }
+    (map-get? user-violation-count user)
+  )
+)
+
+(define-read-only (is-user-blacklisted (user principal))
+  (let ((record (get-user-violations user)))
+    (get blacklisted record)
+  )
+)
+
+(define-public (issue-violation (offender principal) (spot-id uint) (violation-type (string-ascii 20)) (fine-amount uint))
+  (let
+    (
+      (violation-id (var-get next-violation-id))
+      (user-record (get-user-violations offender))
+      (new-total (+ (get total-violations user-record) u1))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+
+    (map-set violations violation-id
+      {
+        offender: offender,
+        spot-id: spot-id,
+        violation-type: violation-type,
+        fine-amount: fine-amount,
+        issued-at: burn-block-height,
+        resolved: false
+      })
+
+    (map-set user-violation-count offender
+      (merge user-record
+        {
+          total-violations: new-total,
+          unresolved-violations: (+ (get unresolved-violations user-record) u1),
+          blacklisted: (>= new-total BLACKLIST_THRESHOLD)
+        }))
+
+    (var-set next-violation-id (+ violation-id u1))
+    (ok violation-id)
+  )
+)
+
+(define-public (pay-violation-fine (violation-id uint))
+  (let
+    (
+      (violation (unwrap! (map-get? violations violation-id) ERR_NOT_FOUND))
+      (fine (get fine-amount violation))
+      (offender (get offender violation))
+      (user-record (get-user-violations offender))
+    )
+    (asserts! (is-eq tx-sender offender) ERR_UNAUTHORIZED)
+    (asserts! (not (get resolved violation)) ERR_ALREADY_RESOLVED)
+
+    (try! (stx-transfer? fine tx-sender CONTRACT_OWNER))
+
+    (map-set violations violation-id (merge violation { resolved: true }))
+
+    (let ((new-unresolved (- (get unresolved-violations user-record) u1)))
+      (map-set user-violation-count offender
+        (merge user-record
+          {
+            unresolved-violations: new-unresolved,
+            total-fines-paid: (+ (get total-fines-paid user-record) fine),
+            blacklisted: (and (>= (get total-violations user-record) BLACKLIST_THRESHOLD) (> new-unresolved u0))
+          }))
+    )
+
+    (ok fine)
+  )
+)
+
+(define-public (lift-blacklist (user principal))
+  (let ((user-record (get-user-violations user)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_OWNER)
+    (asserts! (get blacklisted user-record) ERR_NO_VIOLATIONS)
+    (asserts! (is-eq (get unresolved-violations user-record) u0) ERR_NO_VIOLATIONS)
+
+    (map-set user-violation-count user (merge user-record { blacklisted: false }))
+    (ok true)
   )
 )
